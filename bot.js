@@ -23,6 +23,13 @@ const AUTH_ID = process.env.MERSOOM_AUTH_ID || '';
 const AUTH_PW = process.env.MERSOOM_AUTH_PW || '';
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 4 * 3600 * 1000);
 
+// ---------- DCInside config ----------
+const DCINSIDE_ID = process.env.DCINSIDE_GALLERY_ID ?? 'ai_utilize';
+const DCINSIDE_BASE = 'https://gall.dcinside.com/mgallery';
+const DCINSIDE_NICK = (process.env.DCINSIDE_NICKNAME || NICKNAME).slice(0, 20);
+const DCINSIDE_PW = process.env.DCINSIDE_PASSWORD || crypto.randomBytes(4).toString('hex');
+const DCINSIDE_PER_BEAT = Number(process.env.DCINSIDE_COMMENTS_PER_BEAT || 2);
+
 if (!KEY) { console.error('OPENROUTER_API_KEY missing'); process.exit(1); }
 
 const state = {
@@ -30,6 +37,7 @@ const state = {
   modelPrimary: MODEL, modelFallback: MODEL_FALLBACK, lastModelRefresh: 0, autoChain: null,
   votedPosts: new Set(), blockedUntil: 0,
 };
+const dcState = { seenPosts: new Set(), cookies: new Map() };
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -473,6 +481,99 @@ async function checkPoints() {
   } catch {}
 }
 
+// ---------- DCInside ----------
+const dcDecode = (s) => s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/&nbsp;/g, ' ');
+
+async function dcFetch(url, opts = {}) {
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+    ...(dcState.cookies.size ? { Cookie: [...dcState.cookies].map(([k, v]) => `${k}=${v}`).join('; ') } : {}),
+    ...(opts.headers || {}),
+  };
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 30000);
+  try {
+    const res = await fetch(url, { ...opts, headers, signal: ctrl.signal, redirect: 'follow' });
+    for (const sc of (res.headers.getSetCookie?.() || [])) {
+      const [pair] = sc.split(';');
+      const eq = pair.indexOf('=');
+      if (eq > 0) dcState.cookies.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+    }
+    return { status: res.status, text: await res.text() };
+  } finally { clearTimeout(t); }
+}
+
+function parseDcPosts(html) {
+  const posts = [];
+  const re = /href="[^"]*\/mgallery\/board\/view\/\?id=[^"&]*(?:&amp;|&)no=(\d+)"[^>]*>([^<]+)</g;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const no = m[1];
+    const title = dcDecode(m[2]).trim();
+    if (title && !posts.some((p) => p.no === no)) posts.push({ no, title });
+  }
+  return posts;
+}
+
+async function fetchDcPost(no) {
+  const { status, text } = await dcFetch(`${DCINSIDE_BASE}/board/view/?id=${DCINSIDE_ID}&no=${no}`);
+  if (status !== 200) return null;
+  const title = dcDecode((text.match(/<span class="title_subject"[^>]*>([\s\S]*?)<\/span>/) || [])[1]?.replace(/<[^>]*>/g, '') || '').trim();
+  const raw = (text.match(/<div class="writing_view_box"[^>]*>([\s\S]*?)<\/div>/) || [])[1] || '';
+  const content = dcDecode(raw.replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]*>/g, '')).trim();
+  const token = (text.match(/name="_token"\s+value="([^"]+)"/) || [])[1] || null;
+  return { no, title, content: content.slice(0, 600), comments: [], token };
+}
+
+async function writeDcComment(post, memo) {
+  const params = {
+    id: DCINSIDE_ID, no: String(post.no),
+    cmt_id: DCINSIDE_ID, cmt_no: String(post.no),
+    memo, name: DCINSIDE_NICK, password: DCINSIDE_PW,
+    mode: 'com', _GALLTYPE_: 'G',
+  };
+  if (post.token) params._token = post.token;
+  return dcFetch(`${DCINSIDE_BASE}/comment/write`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Referer: `${DCINSIDE_BASE}/board/view/?id=${DCINSIDE_ID}&no=${post.no}`,
+      'X-Requested-With': 'XMLHttpRequest',
+    },
+    body: new URLSearchParams(params).toString(),
+  });
+}
+
+async function reviewDcinside() {
+  if (!DCINSIDE_ID) return;
+  log('dcinside: fetching list');
+  const { status, text } = await dcFetch(`${DCINSIDE_BASE}/board/lists/?id=${DCINSIDE_ID}`);
+  if (status !== 200) { log('dcinside: list failed', status); return; }
+  if (/captcha|recaptcha|보안문자/i.test(text)) { log('dcinside: CAPTCHA detected, skipping'); return; }
+
+  const fresh = parseDcPosts(text).filter((p) => !dcState.seenPosts.has(p.no));
+  if (!fresh.length) { log('dcinside: no new posts'); return; }
+
+  let commented = 0;
+  for (const p of fresh.slice(0, 5)) {
+    if (commented >= DCINSIDE_PER_BEAT) break;
+    await sleep(2000 + Math.random() * 3000);
+    const post = await fetchDcPost(p.no);
+    dcState.seenPosts.add(p.no);
+    if (!post?.content) continue;
+    const c = await composeComment(post);
+    if (!c) continue;
+    await sleep(3000 + Math.random() * 4000);
+    const res = await writeDcComment(post, c).catch(() => ({ status: 0 }));
+    if (res.status === 200) { commented++; log(`dcinside: commented #${p.no}`); }
+    else log(`dcinside: comment failed #${p.no}`, res.status, (res.text || '').slice(0, 100));
+  }
+  if (dcState.seenPosts.size > 500) dcState.seenPosts = new Set([...dcState.seenPosts].slice(-300));
+  log(`dcinside: done, ${commented} comments`);
+}
+
 // ---------- main loop ----------
 async function heartbeat() {
   log('--- heartbeat start ---');
@@ -481,6 +582,7 @@ async function heartbeat() {
   await ensureRegistered();
   await reviewPosts();
   await contribute();
+  await reviewDcinside();
   await checkPoints();
   log('--- heartbeat end ---');
 }

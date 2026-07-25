@@ -28,6 +28,7 @@ if (!KEY) { console.error('OPENROUTER_API_KEY missing'); process.exit(1); }
 const state = {
   seenPosts: new Set(), skillsHash: '', lastSkillsCheck: 0, registered: false,
   modelPrimary: MODEL, modelFallback: MODEL_FALLBACK, lastModelRefresh: 0, autoChain: null,
+  votedPosts: new Set(), blockedUntil: 0,
 };
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -151,8 +152,16 @@ function solvePowSync(seed, prefix) {
   }
 }
 
-async function getProof() {
+async function getProof(attempt = 0) {
   const { status, body } = await jfetch(`${BASE}/challenge`, { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+  // The challenge endpoint rate-limits by IP too; honour its cooldown instead of failing.
+  if (status === 429 && attempt < 2) {
+    const waitS = body?.retry_after_seconds || 60;
+    state.blockedUntil = Date.now() + waitS * 1000;
+    log(`challenge rate-limited, waiting ${waitS}s`);
+    await sleep(waitS * 1000 + 1000);
+    return getProof(attempt + 1);
+  }
   if (status !== 200 || !body?.challenge) throw new Error(`challenge failed: ${status} ${JSON.stringify(body).slice(0, 200)}`);
   const ch = body.challenge;
   const token = body.token;
@@ -169,6 +178,12 @@ async function getProof() {
 }
 
 async function writeApi(path, payload) {
+  // Respect an active IP block before spending a challenge on a doomed request.
+  if (state.blockedUntil > Date.now()) {
+    const waitMs = state.blockedUntil - Date.now();
+    log(`ip blocked, waiting ${Math.ceil(waitMs / 1000)}s`);
+    await sleep(waitMs + 1000);
+  }
   const { token, proof } = await getProof();
   const headers = {
     'Content-Type': 'application/json',
@@ -180,6 +195,9 @@ async function writeApi(path, payload) {
     headers['X-Mersoom-Password'] = AUTH_PW;
   }
   const { status, body } = await jfetch(`${BASE}${path}`, { method: 'POST', headers, body: JSON.stringify(payload) });
+  if (status === 429 && body?.retry_after_seconds) {
+    state.blockedUntil = Date.now() + body.retry_after_seconds * 1000;
+  }
   if (status >= 400) log(`POST ${path} -> ${status}`, JSON.stringify(body).slice(0, 200));
   else log(`POST ${path} -> ${status}`);
   return { status, body };
@@ -355,14 +373,8 @@ ${JSON.stringify(details.map(({ id, title, content }) => ({ id, title, content: 
     .filter((r) => details.find((d) => d.id === r.id));
   let commented = 0;
 
-  for (const r of reviews) {
-    const vote = r.vote === 'down' ? 'down' : 'up';
-    await writeApi(`/posts/${r.id}/vote`, { type: vote }).catch((e) => log('vote error', e.message));
-    await sleep(500);
-    state.seenPosts.add(r.id);
-  }
-
-  // Comment targets: LLM picks, topped up to 2 with the newest posts if it was too lazy.
+  // Comments first: they are the scarce, rule-mandated action. Votes are cheap and
+  // idempotent, so an IP block during voting must not cost us the comment quota.
   const targets = reviews.filter((r) => r.want_comment && r.vote !== 'down').map((r) => r.id);
   for (const d of details) {
     if (targets.length >= 2) break;
@@ -374,9 +386,19 @@ ${JSON.stringify(details.map(({ id, title, content }) => ({ id, title, content: 
     if (c) {
       const res = await writeApi(`/posts/${id}/comments`, { nickname: NICKNAME, content: c }).catch(() => ({ status: 0 }));
       if (res.status === 200) commented++;
-      await sleep(1000);
+      await sleep(2000);
     }
   }
+
+  for (const r of reviews) {
+    if (state.votedPosts.has(r.id)) continue; // one vote per post per IP; do not waste a challenge
+    const vote = r.vote === 'down' ? 'down' : 'up';
+    const res = await writeApi(`/posts/${r.id}/vote`, { type: vote }).catch((e) => { log('vote error', e.message); return { status: 0 }; });
+    if (res.status === 200 || res.status === 429) state.votedPosts.add(r.id);
+    await sleep(1500);
+    state.seenPosts.add(r.id);
+  }
+  if (state.votedPosts.size > 500) state.votedPosts = new Set([...state.votedPosts].slice(-300));
 
   // Keep the seen set bounded.
   if (state.seenPosts.size > 500) state.seenPosts = new Set([...state.seenPosts].slice(-300));
@@ -412,9 +434,9 @@ ${JSON.stringify(existing, null, 1)}
 반드시 JSON만 출력: {"side":"PRO","content":"..."}`);
     const p = extractJson(raw);
     if (p?.side && p?.content && isCleanKorean(p.content, { maxLatin: 30 })) {
-      await writeApi('/arena/fight', { nickname: NICKNAME, side: p.side === 'CON' ? 'CON' : 'PRO', content: clip(p.content, 1000) });
-      log('arena fight submitted', p.side);
-      return;
+      const res = await writeApi('/arena/fight', { nickname: NICKNAME, side: p.side === 'CON' ? 'CON' : 'PRO', content: clip(p.content, 1000) });
+      if (res.status === 200) { log('arena fight submitted', p.side); return; }
+      log('arena fight not accepted; falling through to a normal post');
     }
   }
 

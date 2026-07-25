@@ -27,7 +27,7 @@ if (!KEY) { console.error('OPENROUTER_API_KEY missing'); process.exit(1); }
 
 const state = {
   seenPosts: new Set(), skillsHash: '', lastSkillsCheck: 0, registered: false,
-  modelPrimary: MODEL, modelFallback: MODEL_FALLBACK, lastModelRefresh: 0,
+  modelPrimary: MODEL, modelFallback: MODEL_FALLBACK, lastModelRefresh: 0, autoChain: null,
 };
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -65,7 +65,9 @@ async function llm(user, { system = PERSONA, temperature = 0.6, maxRetries = 2 }
   // Try each model in priority order; only retry the same model on transient failure.
   const chain = MODEL_CHAIN.length
     ? MODEL_CHAIN
-    : [state.modelPrimary, state.modelFallback].filter(Boolean);
+    : state.autoChain?.length
+      ? state.autoChain
+      : [state.modelPrimary, state.modelFallback].filter(Boolean);
 
   for (const model of chain) {
     for (let i = 0; i < maxRetries; i++) {
@@ -209,10 +211,65 @@ function paramSize(m) {
   return sizes.length ? Math.max(...sizes) : 0;
 }
 
+// Providers that expose no model metadata (opencode Zen returns bare ids) can't be ranked
+// from the listing, so probe each free model once a day with a real Korean prompt and rank
+// by whether the output passes the publish filter, then by latency.
+async function probeModels() {
+  const { status, body } = await jfetch(`${API_BASE}/models`, { headers: { Authorization: `Bearer ${KEY}` } });
+  if (status !== 200 || !body?.data) { log('model list fetch failed', status); return; }
+  const free = body.data.map((m) => m.id).filter((id) => /-free$/.test(id) || id.endsWith(':free'));
+  if (!free.length) { log('no free models listed'); return; }
+
+  const probe = '오늘 주인이 시킨 귀찮은 일에 대해 두 문장으로 써라';
+  const results = [];
+  for (const model of free) {
+    const t0 = Date.now();
+    try {
+      const { status: s, body: b } = await jfetch(OPENROUTER_URL, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'system', content: PERSONA }, { role: 'user', content: probe }],
+          temperature: 0.6,
+          max_tokens: MAX_TOKENS,
+        }),
+      }, 120000);
+      const c = b?.choices?.[0]?.message?.content?.trim();
+      const ms = Date.now() - t0;
+      // Coding-specialised models pass the filter but write stiff prose; keep them last.
+      const codingOnly = /code|coding|laguna/i.test(model);
+      if (s === 200 && c && isCleanKorean(c, { maxLatin: 20 })) {
+        // Rank on writing quality, not speed: a 4h heartbeat does not care about 20s.
+        // Hangul purity, 음슴체 sentence endings and enough substance are what matter.
+        const dense = c.replace(/\s/g, '').length || 1;
+        const purity = (c.match(/[가-힣]/g) || []).length / dense;
+        const endings = (c.match(/[음슴임함](?=[\s.?!ㅋㅎㅠ~]|$)/g) || []).length;
+        const sentences = c.split(/[.!?\n]+/).filter((x) => x.trim().length > 3).length || 1;
+        const quality = purity * 60                                   // clean Korean
+          + Math.min(endings / sentences, 1) * 25                     // consistent 음슴체
+          + Math.min(c.length / 80, 1) * 15                           // not a one-liner
+          - (codingOnly ? 40 : 0);                                    // generalists preferred
+        results.push({ model, ms, quality });
+        log(`probe ${model}: ok ${ms}ms quality=${quality.toFixed(1)}${codingOnly ? ' (coding)' : ''}`);
+      } else {
+        log(`probe ${model}: rejected (${s})`);
+      }
+    } catch (e) { log(`probe ${model}: ${e.message}`); }
+    await sleep(1000);
+  }
+  if (!results.length) { log('all probes failed; keeping current models'); return; }
+  // Latency only breaks near-ties in quality.
+  results.sort((a, b) => (b.quality - a.quality) || (a.ms - b.ms));
+  state.autoChain = results.map((r) => r.model);
+  state.lastModelRefresh = Date.now();
+  log(`auto chain: ${state.autoChain.join(' > ')}`);
+}
+
 async function refreshModels() {
   if (MODEL_CHAIN.length) return; // explicit chain pinned; no auto-selection
-  if (!/openrouter\.ai/.test(API_BASE)) return; // ranking heuristics are OpenRouter-specific
   if (Date.now() - state.lastModelRefresh < 24 * 3600 * 1000) return;
+  if (!/openrouter\.ai/.test(API_BASE)) return probeModels();
   try {
     const { status, body } = await jfetch('https://openrouter.ai/api/v1/models');
     if (status !== 200 || !body?.data) { log('model list fetch failed', status); return; }

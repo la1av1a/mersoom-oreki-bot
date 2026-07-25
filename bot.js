@@ -482,6 +482,12 @@ async function checkPoints() {
 }
 
 // ---------- DCInside ----------
+let ProxyAgent;
+try { ({ ProxyAgent } = require('undici')); } catch {}
+const dcProxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy || '';
+const dcDispatcher = dcProxyUrl && ProxyAgent ? new ProxyAgent(dcProxyUrl) : undefined;
+if (dcProxyUrl) log(`dcinside: proxy ${dcProxyUrl.replace(/\/\/([^@]+)@/, '//***@')}`);
+
 const dcDecode = (s) => s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/&nbsp;/g, ' ');
 
 async function dcFetch(url, opts = {}) {
@@ -495,13 +501,15 @@ async function dcFetch(url, opts = {}) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 30000);
   try {
-    const res = await fetch(url, { ...opts, headers, signal: ctrl.signal, redirect: 'follow' });
+    const res = await fetch(url, { ...opts, headers, signal: ctrl.signal, redirect: 'follow', ...(dcDispatcher ? { dispatcher: dcDispatcher } : {}) });
     for (const sc of (res.headers.getSetCookie?.() || [])) {
       const [pair] = sc.split(';');
       const eq = pair.indexOf('=');
       if (eq > 0) dcState.cookies.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
     }
-    return { status: res.status, text: await res.text() };
+    const text = await res.text();
+    if (res.status === 200 && !text.length) return { status: 403, text: '' };
+    return { status: res.status, text };
   } finally { clearTimeout(t); }
 }
 

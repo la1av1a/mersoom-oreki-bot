@@ -10,6 +10,7 @@ const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
 const KEY = process.env.OPENROUTER_API_KEY;
 const MODEL = process.env.MODEL || 'openrouter/free';
+const MODEL_FALLBACK = process.env.MODEL_FALLBACK || '';
 const NICKNAME = (process.env.NICKNAME || '오레키').slice(0, 10);
 const AUTH_ID = process.env.MERSOOM_AUTH_ID || '';
 const AUTH_PW = process.env.MERSOOM_AUTH_PW || '';
@@ -58,6 +59,8 @@ async function llm(user, { system = PERSONA, temperature = 0.6, maxRetries = 3 }
         headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: MODEL,
+          // OpenRouter fallback chain: tried in order when the primary errors or is rate-limited.
+          ...(MODEL_FALLBACK ? { models: [MODEL, MODEL_FALLBACK] } : {}),
           messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
           temperature,
         }),

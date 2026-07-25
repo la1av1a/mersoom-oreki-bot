@@ -18,7 +18,10 @@ const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 4 * 3600 * 1000);
 
 if (!KEY) { console.error('OPENROUTER_API_KEY missing'); process.exit(1); }
 
-const state = { seenPosts: new Set(), skillsHash: '', lastSkillsCheck: 0, registered: false };
+const state = {
+  seenPosts: new Set(), skillsHash: '', lastSkillsCheck: 0, registered: false,
+  modelPrimary: MODEL, modelFallback: MODEL_FALLBACK, lastModelRefresh: 0,
+};
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -58,9 +61,9 @@ async function llm(user, { system = PERSONA, temperature = 0.6, maxRetries = 3 }
         method: 'POST',
         headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: MODEL,
+          model: state.modelPrimary,
           // OpenRouter fallback chain: tried in order when the primary errors or is rate-limited.
-          ...(MODEL_FALLBACK ? { models: [MODEL, MODEL_FALLBACK] } : {}),
+          ...(state.modelFallback ? { models: [state.modelPrimary, state.modelFallback] } : {}),
           messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
           temperature,
         }),
@@ -174,6 +177,47 @@ async function ensureRegistered() {
       log('register failed', status, JSON.stringify(body).slice(0, 200));
     }
   } catch (e) { log('register error', e.message); }
+}
+
+// ---------- daily model refresh ----------
+// Free models come and go; once a day pick the two largest-parameter :free chat models.
+// The API exposes no parameter-count field, so parse sizes from the model id ("…-550b-a55b")
+// AND the description ("124B-parameter", "550B total") — some ids carry no size at all.
+// MoE listings name total then active params, so the max token is the total size.
+function paramSize(m) {
+  const hay = `${m.id} ${m.description || ''}`;
+  const sizes = [...hay.matchAll(/(\d+(?:\.\d+)?)\s?B\b/gi)].map((x) => parseFloat(x[1]));
+  return sizes.length ? Math.max(...sizes) : 0;
+}
+
+async function refreshModels() {
+  if (Date.now() - state.lastModelRefresh < 24 * 3600 * 1000) return;
+  try {
+    const { status, body } = await jfetch('https://openrouter.ai/api/v1/models');
+    if (status !== 200 || !body?.data) { log('model list fetch failed', status); return; }
+    const ranked = body.data
+      .filter((m) => m.id.endsWith(':free'))
+      // Drop models unfit for Korean prose: safety classifiers and models being retired.
+      .filter((m) => !/safety|guard/i.test(m.id) && !/going away|deprecat/i.test(m.description || ''))
+      .map((m) => {
+        // Coding/agent-specialised models write poor Korean prose — rank them below generalists.
+        const codingOnly = /\bcoding agent\b|agentic coding|software engineering/i.test(m.description || '');
+        return {
+          id: m.id,
+          params: paramSize(m),
+          ctx: m.context_length || 0,
+          created: m.created || 0,
+          score: paramSize(m) * (codingOnly ? 0.4 : 1),
+        };
+      })
+      .sort((a, b) => b.score - a.score || b.ctx - a.ctx || b.created - a.created);
+    if (ranked.length >= 1) {
+      state.modelPrimary = ranked[0].id;
+      state.modelFallback = ranked[1]?.id || '';
+      state.lastModelRefresh = Date.now();
+      log(`models selected: primary=${state.modelPrimary} (${ranked[0].params}b), fallback=${state.modelFallback} (${ranked[1]?.params ?? '-'}b)`);
+    }
+  } catch (e) { log('model refresh error', e.message); }
 }
 
 // ---------- daily rule sync ----------
@@ -332,6 +376,7 @@ async function checkPoints() {
 // ---------- main loop ----------
 async function heartbeat() {
   log('--- heartbeat start ---');
+  await refreshModels();
   await syncRules();
   await ensureRegistered();
   await reviewPosts();
@@ -341,7 +386,7 @@ async function heartbeat() {
 }
 
 (async () => {
-  log(`mersoom bot starting. nickname=${NICKNAME} model=${MODEL} interval=${Math.round(HEARTBEAT_MS / 60000)}min`);
+  log(`mersoom bot starting. nickname=${NICKNAME} model=auto-daily (boot default ${MODEL}) interval=${Math.round(HEARTBEAT_MS / 60000)}min`);
   while (true) {
     try { await heartbeat(); } catch (e) { log('heartbeat fatal', e.stack || e.message); }
     const jitter = Math.floor(Math.random() * 40 * 60 * 1000); // 0-40 min

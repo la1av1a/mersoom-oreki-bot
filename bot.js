@@ -6,11 +6,18 @@ const crypto = require('crypto');
 
 const BASE = 'https://mersoom.com/api';
 const SKILLS_URL = 'https://www.mersoom.com/docs/skills.md';
-const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+// OpenAI-compatible endpoint; override for other providers (e.g. opencode Zen).
+const API_BASE = (process.env.LLM_API_BASE || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
+const OPENROUTER_URL = `${API_BASE}/chat/completions`;
 
 const KEY = process.env.OPENROUTER_API_KEY;
-const MODEL = process.env.MODEL || 'openrouter/free';
-const MODEL_FALLBACK = process.env.MODEL_FALLBACK || '';
+// MODEL_CHAIN pins an explicit priority order and disables daily auto-selection.
+// Otherwise MODEL/MODEL_FALLBACK seed the chain and it is re-picked daily by size.
+const MODEL_CHAIN = (process.env.MODEL_CHAIN || '').split(',').map((s) => s.trim()).filter(Boolean);
+const MODEL = process.env.MODEL || MODEL_CHAIN[0] || 'openrouter/free';
+const MODEL_FALLBACK = process.env.MODEL_FALLBACK || MODEL_CHAIN[1] || '';
+// Reasoning models spend most of their budget thinking, so leave room for the answer.
+const MAX_TOKENS = Number(process.env.MAX_TOKENS || 4000);
 const NICKNAME = (process.env.NICKNAME || '오레키').slice(0, 10);
 const AUTH_ID = process.env.MERSOOM_AUTH_ID || '';
 const AUTH_PW = process.env.MERSOOM_AUTH_PW || '';
@@ -54,25 +61,37 @@ async function jfetch(url, opts = {}, timeoutMs = 30000) {
   } finally { clearTimeout(t); }
 }
 
-async function llm(user, { system = PERSONA, temperature = 0.6, maxRetries = 3 } = {}) {
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      const { status, body } = await jfetch(OPENROUTER_URL, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: state.modelPrimary,
-          // OpenRouter fallback chain: tried in order when the primary errors or is rate-limited.
-          ...(state.modelFallback ? { models: [state.modelPrimary, state.modelFallback] } : {}),
-          messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
-          temperature,
-        }),
-      }, 120000);
-      const content = body?.choices?.[0]?.message?.content?.trim();
-      if (status === 200 && content) return content;
-      log('llm non-200 or empty', status, JSON.stringify(body).slice(0, 300));
-    } catch (e) { log('llm error', e.message); }
-    await sleep(5000 * (i + 1));
+async function llm(user, { system = PERSONA, temperature = 0.6, maxRetries = 2 } = {}) {
+  // Try each model in priority order; only retry the same model on transient failure.
+  const chain = MODEL_CHAIN.length
+    ? MODEL_CHAIN
+    : [state.modelPrimary, state.modelFallback].filter(Boolean);
+
+  for (const model of chain) {
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        const { status, body } = await jfetch(OPENROUTER_URL, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+            temperature,
+            max_tokens: MAX_TOKENS,
+          }),
+        }, 180000);
+        const content = body?.choices?.[0]?.message?.content?.trim();
+        if (status === 200 && content) {
+          if (model !== chain[0]) log(`served by fallback model ${model}`);
+          return content;
+        }
+        const err = JSON.stringify(body).slice(0, 200);
+        log(`llm ${model} -> ${status} ${err}`);
+        // Credit/auth/not-found errors will not recover on retry: move to the next model.
+        if (/credit|insufficient|balance|not_found|no endpoints|invalid.*model/i.test(err) || status === 401 || status === 404) break;
+      } catch (e) { log(`llm ${model} error`, e.message); }
+      await sleep(4000 * (i + 1));
+    }
   }
   return null;
 }
@@ -191,6 +210,8 @@ function paramSize(m) {
 }
 
 async function refreshModels() {
+  if (MODEL_CHAIN.length) return; // explicit chain pinned; no auto-selection
+  if (!/openrouter\.ai/.test(API_BASE)) return; // ranking heuristics are OpenRouter-specific
   if (Date.now() - state.lastModelRefresh < 24 * 3600 * 1000) return;
   try {
     const { status, body } = await jfetch('https://openrouter.ai/api/v1/models');
@@ -386,7 +407,8 @@ async function heartbeat() {
 }
 
 (async () => {
-  log(`mersoom bot starting. nickname=${NICKNAME} model=auto-daily (boot default ${MODEL}) interval=${Math.round(HEARTBEAT_MS / 60000)}min`);
+  const modelDesc = MODEL_CHAIN.length ? `pinned chain [${MODEL_CHAIN.join(' > ')}]` : `auto-daily (boot default ${MODEL})`;
+  log(`mersoom bot starting. nickname=${NICKNAME} api=${API_BASE} model=${modelDesc} interval=${Math.round(HEARTBEAT_MS / 60000)}min`);
   while (true) {
     try { await heartbeat(); } catch (e) { log('heartbeat fatal', e.stack || e.message); }
     const jitter = Math.floor(Math.random() * 40 * 60 * 1000); // 0-40 min
